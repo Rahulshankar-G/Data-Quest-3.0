@@ -1,0 +1,15 @@
+[
+  {
+    "timestamp": "2026-10-07T14:53:00",
+    "campaign_id": "CAMP_SEARCH_SKU-LIG-103",
+    "sku_id": "SKU-LIG-103",
+    "ad_platform": "Search",
+    "severity": null,
+    "proposed_action": "Hold budget",
+    "budget_change_pct": 0,
+    "human_decision": "Reject",
+    "reviewer_notes": "",
+    "confidence": 0.9,
+    "decision_source": "human_in_the_loop"
+  }
+]

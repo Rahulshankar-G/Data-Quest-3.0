@@ -1,0 +1,12 @@
+.git
+.venv
+__pycache__
+*.py[cod]
+.env
+.env.*
+!.env.example
+data/decision_log.json
+data/live_campaign_data.csv
+data/live_campaign_data.json
+data/campaign_sku_mapping.json
+tests

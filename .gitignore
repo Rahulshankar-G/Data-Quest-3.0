@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+data/campaign_sku_mapping.json
+data/live_campaign_data.csv
+data/live_campaign_data.json
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+frontend/node_modules/
+frontend/.next/
+frontend/*.tsbuildinfo
+data/*.db
+data/*.sqlite
+data/*.sqlite3
