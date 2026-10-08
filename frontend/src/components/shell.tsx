@@ -40,12 +40,8 @@ export function Shell({ children }: Readonly<{ children: React.ReactNode }>) {
             );
           })}
         </nav>
-        <div className="absolute inset-x-4 bottom-5 space-y-2">
+        <div className="absolute inset-x-4 bottom-5">
           <button onClick={() => setScenarioGuideOpen(true)} className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm text-slate-400 hover:bg-white/[.04]"><CircleHelp size={16} />Scenario guide</button>
-          <div className="rounded-xl border border-line bg-surface p-3">
-            <div className="flex items-center gap-2 text-xs text-slate-300"><span className="h-2 w-2 rounded-full bg-accent" />Simulator mode</div>
-            <p className="mb-0 mt-1 text-[11px] leading-relaxed text-slate-500">Actions are simulated. No ad account is changed.</p>
-          </div>
         </div>
       </aside>
       <div className="lg:pl-[250px]">
