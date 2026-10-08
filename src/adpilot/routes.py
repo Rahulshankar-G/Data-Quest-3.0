@@ -1089,34 +1089,134 @@ async def learning(session: AsyncSession = Depends(get_session)):
 @router.get("/sources")
 async def source_health(session: AsyncSession = Depends(get_session)):
     brand = await _brand(session)
-    counts = {
-        "platforms": await session.scalar(select(func.count()).select_from(Platform)),
-        "campaigns": await session.scalar(
-            select(func.count()).select_from(Campaign).where(Campaign.brand_id == brand.id)
+    platforms = list((await session.scalars(select(Platform))).all())
+    facts = list(
+        (
+            await session.scalars(
+                select(UnifiedFact).where(UnifiedFact.brand_id == brand.id)
+            )
+        ).all()
+    )
+    campaigns = list(
+        (
+            await session.scalars(
+                select(Campaign).where(Campaign.brand_id == brand.id)
+            )
+        ).all()
+    )
+    campaigns_by_platform: dict[str, int] = {}
+    platform_names = {platform.id: platform.name for platform in platforms}
+    campaign_platforms: dict[str, str] = {}
+    for campaign in campaigns:
+        campaigns_by_platform[campaign.platform_id] = (
+            campaigns_by_platform.get(campaign.platform_id, 0) + 1
+        )
+        if campaign.platform_id in platform_names:
+            campaign_platforms[campaign.id] = platform_names[campaign.platform_id]
+    facts_by_platform: dict[str, list[UnifiedFact]] = {}
+    for fact in facts:
+        source_name = campaign_platforms.get(fact.campaign_id, fact.platform)
+        facts_by_platform.setdefault(source_name, []).append(fact)
+    products_count = await session.scalar(
+        select(func.count()).select_from(Product).where(Product.brand_id == brand.id)
+    )
+    orders_count = await session.scalar(
+        select(func.count()).select_from(Order).where(Order.brand_id == brand.id)
+    )
+    attribute_fields = {
+        "date": lambda row: row.fact_date is not None,
+        "spend": lambda row: math.isfinite(row.spend) and row.spend >= 0,
+        "revenue": lambda row: (
+            math.isfinite(row.attributed_revenue)
+            and row.attributed_revenue >= 0
+            and math.isfinite(row.reconciled_revenue)
+            and row.reconciled_revenue >= 0
         ),
-        "products": await session.scalar(
-            select(func.count()).select_from(Product).where(Product.brand_id == brand.id)
-        ),
-        "orders": await session.scalar(
-            select(func.count()).select_from(Order).where(Order.brand_id == brand.id)
-        ),
-        "facts": await session.scalar(
-            select(func.count()).select_from(UnifiedFact).where(UnifiedFact.brand_id == brand.id)
+        "impressions": lambda row: row.impressions >= 0,
+        "clicks": lambda row: row.clicks >= 0,
+        "conversions": lambda row: (
+            math.isfinite(row.conversions) and row.conversions >= 0
         ),
     }
-    return [
-        {
-            "key": connector_key,
-            "name": platform.name,
-            "mode": "simulator",
-            "status": "healthy",
-            "health_score": 100,
-            "record_counts": counts,
-            "last_ingest": datetime.now(timezone.utc).isoformat(),
+    platforms_by_key = {platform.key: platform for platform in platforms}
+    sources = []
+    connected_platform_ids: set[str] = set()
+    for connector_key, connector in CONNECTORS.items():
+        platform = platforms_by_key.get(connector.platform_key)
+        if platform is None:
+            continue
+        connected_platform_ids.add(platform.id)
+        sources.append(
+            _source_health_payload(
+                connector_key,
+                platform,
+                facts_by_platform.get(platform.name, []),
+                campaigns_by_platform.get(platform.id, 0),
+                products_count or 0,
+                orders_count or 0,
+                attribute_fields,
+            )
+        )
+    for platform in platforms:
+        if platform.id in connected_platform_ids:
+            continue
+        sources.append(
+            _source_health_payload(
+                platform.key,
+                platform,
+                facts_by_platform.get(platform.name, []),
+                campaigns_by_platform.get(platform.id, 0),
+                products_count or 0,
+                orders_count or 0,
+                attribute_fields,
+                mode="import",
+            )
+        )
+    return sources
+
+
+def _source_health_payload(
+    connector_key: str,
+    platform: Platform,
+    facts: list[UnifiedFact],
+    campaign_count: int,
+    products_count: int,
+    orders_count: int,
+    attribute_fields: dict[str, Any],
+    mode: str = "simulator",
+) -> dict[str, Any]:
+    total = len(facts)
+    attribute_health = {}
+    for name, check in attribute_fields.items():
+        accepted = sum(bool(check(fact)) for fact in facts)
+        attribute_health[name] = {
+            "accepted": accepted,
+            "total": total,
+            "health_score": accepted / total * 100 if total else 0,
         }
-        for connector_key, connector in CONNECTORS.items()
-        if (platform := await session.scalar(select(Platform).where(Platform.key == connector.platform_key)))
-    ]
+    attribute_records = sum(item["total"] for item in attribute_health.values())
+    accepted_attributes = sum(item["accepted"] for item in attribute_health.values())
+    health_score = (
+        accepted_attributes / attribute_records * 100
+        if attribute_records
+        else 0
+    )
+    return {
+        "key": connector_key,
+        "name": platform.name,
+        "mode": mode,
+        "status": "healthy" if health_score == 100 else "degraded",
+        "health_score": health_score,
+        "attribute_health": attribute_health,
+        "record_counts": {
+            "platforms": 1,
+            "campaigns": campaign_count,
+            "products": products_count,
+            "orders": orders_count,
+            "facts": total,
+        },
+        "last_ingest": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 @router.post("/ingest/upload")
@@ -1246,36 +1346,61 @@ async def upload_data(
             )
             session.add(account)
             await session.flush()
-    campaign = Campaign(
-        brand_id=brand.id,
-        ad_account_id=account.id,
-        platform_id=platform.id,
-        external_id=f"CSV-{uuid4().hex[:12]}",
-        name=file.filename[:190],
-        objective="imported performance",
-        status="active",
-        daily_budget=0,
-        metadata_json={"source_filename": file.filename, "imported": True},
-    )
-    session.add(campaign)
-    await session.flush()
-    for _, row in frame.iterrows():
+    campaigns_by_name: dict[str, Campaign] = {}
+    seen_campaign_dates: set[tuple[str, Any]] = set()
+    imported_campaign_ids: list[str] = []
+    for row_index, (_, row) in enumerate(frame.iterrows(), start=1):
         spend = float(row["spend"])
         revenue = float(row["revenue"])
         clicks = int(row["clicks"])
         impressions = int(row["impressions"])
         conversions = float(row["conversions"])
         metric_date = row["date"]
+        campaign_name = str(row["campaign"])
+        campaign_date = (campaign_name, metric_date)
+        if campaign_date in seen_campaign_dates:
+            row_campaign = Campaign(
+                brand_id=brand.id,
+                ad_account_id=account.id,
+                platform_id=platform.id,
+                external_id=f"CSV-{uuid4().hex[:12]}",
+                name=f"{campaign_name[:160]} (duplicate {row_index})",
+                objective="imported performance",
+                status="active",
+                daily_budget=0,
+                metadata_json={"source_filename": file.filename, "imported": True},
+            )
+            session.add(row_campaign)
+            await session.flush()
+        else:
+            seen_campaign_dates.add(campaign_date)
+            row_campaign = campaigns_by_name.get(campaign_name)
+            if row_campaign is None:
+                row_campaign = Campaign(
+                    brand_id=brand.id,
+                    ad_account_id=account.id,
+                    platform_id=platform.id,
+                    external_id=f"CSV-{uuid4().hex[:12]}",
+                    name=campaign_name[:190],
+                    objective="imported performance",
+                    status="active",
+                    daily_budget=0,
+                    metadata_json={"source_filename": file.filename, "imported": True},
+                )
+                campaigns_by_name[campaign_name] = row_campaign
+                session.add(row_campaign)
+                await session.flush()
+        imported_campaign_ids.append(row_campaign.id)
         session.add(
             AdMetricDaily(
-                campaign_id=campaign.id,
+                campaign_id=row_campaign.id,
                 metric_date=metric_date,
                 spend=spend,
                 impressions=impressions,
                 clicks=clicks,
                 conversions=conversions,
                 attributed_revenue=revenue,
-                source_payload={"upload": file.filename, "campaign": str(row["campaign"])},
+                source_payload={"upload": file.filename, "campaign": campaign_name},
             )
         )
         session.add(
@@ -1283,7 +1408,7 @@ async def upload_data(
                 brand_id=brand.id,
                 fact_date=metric_date,
                 platform="CSV Import",
-                campaign_id=campaign.id,
+                campaign_id=row_campaign.id,
                 spend=spend,
                 attributed_revenue=revenue,
                 reconciled_revenue=revenue,
@@ -1296,7 +1421,23 @@ async def upload_data(
             )
         )
     await session.commit()
-    return {"status": "imported", "campaign_id": campaign.id, "rows": len(frame)}
+    attribute_health = {
+        target: {
+            "accepted": len(frame),
+            "total": len(frame),
+            "health_score": len(frame) / len(frame) * 100,
+        }
+        for target, source in mapping.items()
+        if source is not None
+    }
+    return {
+        "status": "imported",
+        "campaign_id": imported_campaign_ids[0],
+        "rows": len(frame),
+        "accepted_records": len(frame),
+        "total_records": len(frame),
+        "attribute_health": attribute_health,
+    }
 
 
 @router.get("/anomaly-methods")

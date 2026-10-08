@@ -1,12 +1,12 @@
 import unittest
 from datetime import datetime, time, timezone
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from src.adpilot.connectors import CONNECTORS
 from src.adpilot.jobs import ingest_simulator_data
-from src.adpilot.models import AdMetricDaily, Base, Brand, Campaign
+from src.adpilot.models import AdMetricDaily, Base, Brand, Campaign, UnifiedFact
 from src.adpilot.seed import (
     BRAND_NAME,
     branded_search_observation,
@@ -16,6 +16,45 @@ from src.adpilot.seed import (
 
 
 class SeedTests(unittest.IsolatedAsyncioTestCase):
+    async def test_seed_on_existing_brand_preserves_imported_facts(self):
+        engine = create_async_engine("sqlite+aiosqlite://")
+        try:
+            async with engine.begin() as connection:
+                await connection.run_sync(Base.metadata.create_all)
+            session_factory = async_sessionmaker(engine, expire_on_commit=False)
+            async with session_factory() as session:
+                seeded = await seed_demo(session)
+                imported_fact = UnifiedFact(
+                    brand_id=seeded["brand_id"],
+                    fact_date=datetime.now(timezone.utc).date(),
+                    platform="CSV Import",
+                    spend=12.5,
+                    attributed_revenue=30,
+                    reconciled_revenue=30,
+                    contribution_profit=17.5,
+                    source="csv_upload",
+                )
+                session.add(imported_fact)
+                await session.commit()
+
+                existing_campaign_count = await session.scalar(
+                    select(func.count()).select_from(Campaign)
+                )
+                result = await seed_demo(session)
+                preserved_fact = await session.scalar(
+                    select(UnifiedFact).where(UnifiedFact.id == imported_fact.id)
+                )
+                campaign_count = await session.scalar(
+                    select(func.count()).select_from(Campaign)
+                )
+
+                self.assertEqual(result["seeded"], 0)
+                self.assertEqual(result["brand_id"], seeded["brand_id"])
+                self.assertIsNotNone(preserved_fact)
+                self.assertEqual(campaign_count, existing_campaign_count)
+        finally:
+            await engine.dispose()
+
     async def test_seeded_daily_metrics_use_the_same_units_as_simulator_ingestion(self):
         engine = create_async_engine("sqlite+aiosqlite://")
         try:

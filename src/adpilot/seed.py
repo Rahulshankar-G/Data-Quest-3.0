@@ -6,7 +6,6 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.adpilot.auth import hash_password
-from src.adpilot.db import Base, engine
 from src.adpilot.connectors import CONNECTORS, PLATFORMS, SCENARIO_CATALOG
 from src.adpilot.models import (
     Ad,
@@ -34,7 +33,6 @@ from src.adpilot.models import (
     SimulationState,
     UnifiedFact,
     User,
-    new_id,
 )
 
 BRAND_NAME = "AdPilot Demo Brand"
@@ -165,16 +163,11 @@ async def seed_demo(session: AsyncSession) -> dict[str, int]:
     today = datetime.now(timezone.utc).date()
     existing_brand = await session.scalar(select(Brand).where(Brand.name == BRAND_NAME))
     if existing_brand is not None:
-        async with engine.begin() as connection:
-            await connection.run_sync(Base.metadata.drop_all)
-            await connection.run_sync(Base.metadata.create_all)
-        brand = Brand(name=BRAND_NAME, currency_code="USD", timezone="America/New_York")
-        session.add(brand)
-        await session.flush()
-    else:
-        brand = Brand(name=BRAND_NAME, currency_code="USD", timezone="America/New_York")
-        session.add(brand)
-        await session.flush()
+        return {"seeded": 0, "brand_id": existing_brand.id}
+
+    brand = Brand(name=BRAND_NAME, currency_code="USD", timezone="America/New_York")
+    session.add(brand)
+    await session.flush()
 
     roles = [
         Role(name="admin", permissions=["read", "write", "execute", "configure"]),
