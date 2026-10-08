@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Activity, BarChart3, BrainCircuit, Boxes, CircleHelp, GitBranch, Gauge, LayoutDashboard, Lightbulb, ListChecks, ShieldAlert } from "lucide-react";
+import { Activity, ArrowLeftRight, BadgeDollarSign, BarChart3, BrainCircuit, Boxes, CircleHelp, GitBranch, Gauge, LayoutDashboard, Lightbulb, ListChecks, Radio, ShieldAlert } from "lucide-react";
 import { motion } from "framer-motion";
 import { useConsoleStore } from "@/lib/store";
 
@@ -32,7 +32,7 @@ export function Shell({ children }: Readonly<{ children: React.ReactNode }>) {
           {navigation.map(({ href, label, icon: Icon }) => {
             const active = pathname === href;
             return (
-              <Link key={href} href={href} className={`relative flex items-center gap-3 rounded-lg px-3 py-2.5 text-[13px] transition ${active ? "text-white" : "text-slate-400 hover:bg-white/[.04]"}`}>
+              <Link key={href} href={href} className={`relative flex items-center gap-3 rounded-lg px-3 py-2.5 text-[13px] transition ${active ? "text-white" : "text-slate-400 hover:bg-white/[.04] hover:text-slate-100"}`}>
                 {active && <motion.span layoutId="nav-active" className="absolute inset-0 rounded-lg border border-accent/20 bg-accent/[.09]" />}
                 <Icon className={`relative z-10 ${active ? "text-accent" : ""}`} size={16} />
                 <span className="relative z-10">{label}</span>
@@ -51,7 +51,7 @@ export function Shell({ children }: Readonly<{ children: React.ReactNode }>) {
       <div className="lg:pl-[250px]">
         <header className="sticky top-0 z-20 flex h-[68px] items-center justify-between border-b border-line bg-[#090d16]/90 px-5 backdrop-blur-xl md:px-8">
           <div className="flex items-center gap-2 text-xs text-slate-500"><Boxes size={15} /> AdPilot Demo Brand <span className="text-slate-700">/</span> <span className="text-slate-300">All channels</span></div>
-          <div className="flex items-center gap-4"><button onClick={() => setScenarioGuideOpen(true)} className="rounded-full border border-line p-2 text-slate-400 hover:text-white"><CircleHelp size={16} /></button><div className="grid h-8 w-8 place-items-center rounded-full bg-slate-700 text-xs font-semibold">DO</div></div>
+          <div className="flex items-center gap-4"><div className="hidden items-center gap-2 text-xs text-slate-500 sm:flex"><Radio size={14} className="text-accent" /> Pipeline healthy</div><button onClick={() => setScenarioGuideOpen(true)} className="rounded-full border border-line p-2 text-slate-400 hover:text-white"><CircleHelp size={16} /></button><div className="grid h-8 w-8 place-items-center rounded-full bg-slate-700 text-xs font-semibold">DO</div></div>
         </header>
         <main className="mx-auto max-w-[1500px] px-5 py-7 md:px-8">{children}</main>
       </div>
@@ -74,15 +74,15 @@ function ScenarioDrawer() {
     ["high_margin_underpromoted", "High-margin under-promotion", "Healthy stock and margin, low budget"],
   ];
   if (!open) return null;
-  return <div className="fixed inset-0 z-50 flex justify-end bg-black/60" onClick={() => setOpen(false)}><section className="h-full w-full max-w-md overflow-y-auto border-l border-line bg-[#0d1420] p-6" onClick={(event) => event.stopPropagation()}><div className="mb-6 flex items-center justify-between"><div><p className="text-[10px] font-bold uppercase tracking-[.2em] text-accent">Scenario guide</p><h2 className="mt-2 text-xl font-semibold text-white">Operating playbooks</h2></div><button onClick={() => setOpen(false)} className="rounded-full border border-line p-2 text-slate-400 hover:text-white">✕</button></div><div className="space-y-3">{scenarios.map(([key, title, subtitle]) => <div key={key} className="rounded-xl border border-line bg-surface p-3"><p className="text-sm font-medium text-white">{title}</p><p className="mt-1 text-xs text-slate-400">{subtitle}</p></div>)}</div></section></div>;
+  return <div className="fixed inset-0 z-50 flex justify-end bg-black/60" onClick={() => setOpen(false)}><section className="h-full w-full max-w-md overflow-y-auto border-l border-line bg-[#0d1420] p-6" onClick={(event) => event.stopPropagation()}><div className="mb-6 flex items-center justify-between"><div><p className="text-xs uppercase tracking-widest text-accent">Scenario guide</p><h2 className="mt-1 text-xl font-semibold">Explore the seeded cases</h2></div><button className="text-slate-400" onClick={() => setOpen(false)}>Close</button></div><div className="space-y-3">{scenarios.map(([key, title, detail], index) => <Link key={key} href={`/diagnosis?scenario=${key}`} onClick={() => setOpen(false)} className="block rounded-xl border border-line bg-surface p-4 hover:border-accent/40"><div className="flex gap-3"><span className="text-xs font-bold text-accent">0{index + 1}</span><div><strong className="text-sm">{title}</strong><p className="mb-0 mt-1 text-xs text-slate-500">{detail}</p></div></div></Link>)} </div></section></div>;
 }
 
 export function Heading({ eyebrow, title, description }: { eyebrow: string; title: string; description: string }) {
-  return <div className="mb-7"><p className="mb-2 text-[10px] font-bold uppercase tracking-[.2em] text-accent">{eyebrow}</p><h1 className="text-2xl font-semibold tracking-tight text-white md:text-[28px]">{title}</h1><p className="mt-2 max-w-2xl text-sm text-slate-400">{description}</p></div>;
+  return <div className="mb-7"><p className="mb-2 text-[10px] font-bold uppercase tracking-[.2em] text-accent">{eyebrow}</p><h1 className="text-2xl font-semibold tracking-tight text-white md:text-[30px]">{title}</h1><p className="mb-0 mt-2 max-w-3xl text-sm leading-relaxed text-slate-400">{description}</p></div>;
 }
 
 export function Panel({ title, subtitle, children, className = "" }: { title: string; subtitle?: string; children: React.ReactNode; className?: string }) {
-  return <section className={`rounded-2xl border border-line bg-surface/80 p-5 ${className}`}><div className="mb-4"><h2 className="text-sm font-semibold text-slate-100">{title}</h2>{subtitle && <p className="mt-1 text-xs text-slate-400">{subtitle}</p>}</div>{children}</section>;
+  return <section className={`rounded-2xl border border-line bg-surface/80 p-5 ${className}`}><div className="mb-4"><h2 className="text-sm font-semibold text-slate-100">{title}</h2>{subtitle && <p className="mb-0 mt-1 text-xs text-slate-500">{subtitle}</p>}</div>{children}</section>;
 }
 
 export function LoadingError({ error }: { error: Error | null }) {
