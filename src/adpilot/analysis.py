@@ -117,23 +117,37 @@ def fit_response_curve(points: list[dict[str, float]]) -> dict[str, float]:
     if len(points) < 3:
         return {"scale": 0.0, "half_saturation": 1.0, "r_squared": 0.0}
     spend = np.asarray([max(0, point["spend"]) for point in points], dtype=float)
-    profit = np.asarray([point["incremental_profit"] for point in points], dtype=float)
+    value = np.asarray([max(0, point["value"]) for point in points], dtype=float)
 
     def curve(parameters):
         scale, half_saturation = parameters
         return scale * spend / np.maximum(half_saturation + spend, 1e-9)
 
     fitted = minimize(
-        lambda parameters: float(np.square(curve(parameters) - profit).sum()),
-        x0=np.array([max(float(profit.max()), 1.0), max(float(np.median(spend)), 1.0)]),
-        bounds=[(0.01, max(float(profit.max()) * 10, 1.0)), (0.01, max(float(spend.max()) * 5, 1.0))],
+        lambda parameters: float(np.square(curve(parameters) - value).sum()),
+        x0=np.array([max(float(value.max()), 1.0), max(float(np.median(spend)), 1.0)]),
+        bounds=[(0.01, max(float(value.max()) * 10, 1.0)), (0.01, max(float(spend.max()) * 5, 1.0))],
         method="L-BFGS-B",
     )
-    residual = float(np.square(curve(fitted.x) - profit).sum())
-    total = float(np.square(profit - profit.mean()).sum())
+    if fitted.success and np.isfinite(fitted.x).all():
+        parameters = fitted.x
+    else:
+        scale_limit = max(float(value.max()) * 10, 1.0)
+        half_saturation_limit = max(float(spend.max()) * 5, 1.0)
+        best_error = float("inf")
+        parameters = np.array([max(float(value.max()), 0.01), max(float(np.median(spend)), 0.01)])
+        for half_saturation in np.geomspace(0.01, half_saturation_limit, 512):
+            response = spend / np.maximum(half_saturation + spend, 1e-9)
+            scale = float(np.clip(np.dot(response, value) / np.dot(response, response), 0.01, scale_limit))
+            error = float(np.square(scale * response - value).sum())
+            if error < best_error:
+                best_error = error
+                parameters = np.array([scale, half_saturation])
+    residual = float(np.square(curve(parameters) - value).sum())
+    total = float(np.square(value - value.mean()).sum())
     return {
-        "scale": round(float(fitted.x[0]), 4),
-        "half_saturation": round(float(fitted.x[1]), 4),
+        "scale": round(float(parameters[0]), 4),
+        "half_saturation": round(float(parameters[1]), 4),
         "r_squared": round(1 - residual / total, 4) if total > 1e-9 else 0.0,
     }
 
@@ -145,10 +159,35 @@ def optimize_budget(
     target_roas: float | None,
 ) -> dict[str, Any]:
     if not campaigns:
-        return {"allocations": [], "predicted_revenue": 0, "predicted_profit": 0}
-    spend = np.asarray([max(float(row["spend"]), 0.01) for row in campaigns])
-    current_profit = np.asarray([float(row["profit"]) for row in campaigns])
-    roas = np.asarray([max(0.0, float(row["roas"])) for row in campaigns])
+        return {
+            "solver": "scipy.optimize.SLSQP",
+            "converged": False,
+            "status": "No campaigns have usable performance data.",
+            "budget_requested": round(total_budget, 2),
+            "budget_optimized": 0,
+            "budget_adjusted": total_budget != 0,
+            "target_roas_met": target_roas is None or target_roas <= 0,
+            "predicted_revenue": 0,
+            "predicted_profit": 0,
+            "predicted_roas": 0,
+            "allocations": [],
+        }
+    spend = np.asarray([
+        max(float(row.get("daily_budget", row.get("spend", 0.01))), 0.01)
+        for row in campaigns
+    ])
+    roas = np.asarray([max(0.0, float(row.get("roas", 0))) for row in campaigns])
+    revenue_curves = [
+        row.get("revenue_curve", {
+            "scale": roas[index] * spend[index] * 2,
+            "half_saturation": spend[index],
+        })
+        for index, row in enumerate(campaigns)
+    ]
+    cogs_rates = np.asarray([
+        max(0.0, float(row.get("cogs_rate", 0)))
+        for row in campaigns
+    ])
     inventory_days = np.asarray([float(row.get("inventory_cover_days", 999)) for row in campaigns])
     lower = spend * max(0, 1 - max_shift_pct / 100)
     upper = spend * (1 + max_shift_pct / 100)
@@ -156,52 +195,68 @@ def optimize_budget(
         if cover < 5:
             upper[index] = min(upper[index], spend[index] * 0.55)
             lower[index] = min(lower[index], upper[index])
-    if total_budget < float(lower.sum()) or total_budget > float(upper.sum()):
-        target_budget = float(np.clip(total_budget, lower.sum(), upper.sum()))
-    else:
-        target_budget = total_budget
-    response = np.maximum(roas * spend - current_profit, 0)
+    target_budget = float(np.clip(total_budget, lower.sum(), upper.sum()))
+    budget_adjusted = not math.isclose(target_budget, total_budget, abs_tol=0.01)
+
+    def predict_revenue(allocation):
+        return np.asarray([
+            float(curve["scale"]) * allocation[index]
+            / max(float(curve["half_saturation"]) + allocation[index], 1e-9)
+            for index, curve in enumerate(revenue_curves)
+        ])
 
     def predict_profit(allocation):
-        ratio = allocation / spend
-        hill = allocation / (1 + allocation / np.maximum(spend * 2, 1))
-        return current_profit * ratio + response * hill / np.maximum(spend, 1)
+        return predict_revenue(allocation) * (1 - cogs_rates) - allocation
 
-    def objective(allocation):
-        return -float(predict_profit(allocation).sum())
+    def feasible_start():
+        allocation = np.clip(spend, lower, upper)
+        difference = target_budget - float(allocation.sum())
+        for _ in range(len(allocation) + 1):
+            if abs(difference) <= 1e-7:
+                break
+            capacity = upper - allocation if difference > 0 else allocation - lower
+            available = capacity > 1e-9
+            if not np.any(available):
+                break
+            shares = capacity[available] / float(capacity[available].sum())
+            adjustment = np.minimum(capacity[available], abs(difference) * shares)
+            allocation[available] += adjustment if difference > 0 else -adjustment
+            difference = target_budget - float(allocation.sum())
+        return allocation
 
+    initial_allocation = feasible_start()
     constraints = [{"type": "eq", "fun": lambda allocation: float(allocation.sum() - target_budget)}]
     if target_roas is not None and target_roas > 0:
         constraints.append({
             "type": "ineq",
             "fun": lambda allocation: float(
-                (predict_profit(allocation).sum() + allocation.sum()) / max(allocation.sum(), 1e-9)
+                float(predict_revenue(allocation).sum()) / max(float(allocation.sum()), 1e-9)
                 - target_roas
             ),
         })
     result = minimize(
-        objective,
-        x0=np.clip(spend, lower, upper),
+        lambda allocation: -float(predict_profit(allocation).sum()),
+        x0=initial_allocation,
         bounds=list(zip(lower, upper)),
         constraints=constraints,
         method="SLSQP",
         options={"maxiter": 300, "ftol": 1e-8},
     )
-    allocation = result.x if result.success else np.clip(spend, lower, upper)
+    allocation = result.x if result.success else initial_allocation
     predicted = predict_profit(allocation)
-    predicted_revenue = predicted + allocation
+    revenue = predict_revenue(allocation)
+    achieved_roas = float(revenue.sum() / max(float(allocation.sum()), 1e-9))
     return {
         "solver": "scipy.optimize.SLSQP",
         "converged": bool(result.success),
         "status": str(result.message),
         "budget_requested": round(total_budget, 2),
         "budget_optimized": round(float(allocation.sum()), 2),
+        "budget_adjusted": budget_adjusted,
+        "target_roas_met": target_roas is None or target_roas <= 0 or achieved_roas + 1e-6 >= target_roas,
         "predicted_profit": round(float(predicted.sum()), 2),
-        "predicted_revenue": round(float(predicted_revenue.sum()), 2),
-        "predicted_roas": round(
-            float(predicted_revenue.sum() / max(float(allocation.sum()), 1e-9)),
-            4,
-        ),
+        "predicted_revenue": round(float(revenue.sum()), 2),
+        "predicted_roas": round(achieved_roas, 4),
         "allocations": [
             {
                 "campaign_id": row["campaign_id"],
@@ -215,7 +270,7 @@ def optimize_budget(
                 "inventory_cover_days": float(inventory_days[index]),
                 "inventory_guardrail_applied": bool(inventory_days[index] < 5),
                 "predicted_profit": round(float(predicted[index]), 2),
-                "predicted_revenue": round(float(predicted_revenue[index]), 2),
+                "predicted_revenue": round(float(revenue[index]), 2),
             }
             for index, row in enumerate(campaigns)
         ],

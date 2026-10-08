@@ -86,6 +86,10 @@ class ApprovalInput(BaseModel):
     approved_by: str = Field(min_length=2, max_length=160)
 
 
+class ApprovalRevocationInput(BaseModel):
+    revoked_by: str = Field(min_length=2, max_length=160)
+
+
 class ClockAdvanceInput(BaseModel):
     days: int = Field(ge=1, le=30)
 
@@ -302,6 +306,7 @@ async def performance(
             "platform": fact.platform,
             "campaign_id": campaign.id if campaign else None,
             "campaign": campaign.name if campaign else "Unmapped",
+            "daily_budget": float(campaign.daily_budget) if campaign else 0.0,
             "sku": product.sku if product else None,
             "spend": 0.0,
             "revenue": 0.0,
@@ -726,6 +731,41 @@ async def approve_recommendation(
     return _recommendation_dict(recommendation)
 
 
+@router.post("/recommendations/{recommendation_id}/revoke-approval")
+async def revoke_recommendation_approval(
+    recommendation_id: str,
+    payload: ApprovalRevocationInput,
+    session: AsyncSession = Depends(get_session),
+):
+    brand = await _brand(session)
+    recommendation = await session.scalar(
+        select(Recommendation).where(
+            Recommendation.id == recommendation_id,
+            Recommendation.brand_id == brand.id,
+        )
+    )
+    if recommendation is None:
+        raise HTTPException(status_code=404, detail="Recommendation was not found.")
+    if recommendation.status != "approved":
+        raise HTTPException(
+            status_code=409,
+            detail="Only approved, unexecuted recommendations can have approval revoked.",
+        )
+
+    recommendation.status = "proposed"
+    recommendation.payload = {
+        **{
+            key: value
+            for key, value in recommendation.payload.items()
+            if key not in {"approved_by", "approved_at"}
+        },
+        "approval_revoked_by": payload.revoked_by,
+        "approval_revoked_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await session.commit()
+    return _recommendation_dict(recommendation)
+
+
 @router.post("/recommendations/{recommendation_id}/execute")
 async def execute_recommendation(
     recommendation_id: str,
@@ -810,23 +850,74 @@ async def budget_optimizer(
     session: AsyncSession = Depends(get_session),
 ):
     brand = await _brand(session)
-    rows = list(
+    campaigns = list(
         (
-            await session.execute(
-                select(Campaign, func.sum(UnifiedFact.spend), func.sum(UnifiedFact.contribution_profit),
-                       func.sum(UnifiedFact.reconciled_revenue))
-                .join(UnifiedFact, UnifiedFact.campaign_id == Campaign.id)
-                .where(Campaign.brand_id == brand.id)
-                .group_by(Campaign.id)
+            await session.scalars(
+                select(Campaign).where(Campaign.brand_id == brand.id)
             )
         ).all()
     )
+    latest_fact_date = await session.scalar(
+        select(func.max(UnifiedFact.fact_date)).where(
+            UnifiedFact.brand_id == brand.id,
+            UnifiedFact.campaign_id.is_not(None),
+            UnifiedFact.source != "simulator_clock",
+        )
+    )
+    if latest_fact_date is None:
+        result = optimize_budget(
+            [],
+            payload.total_budget,
+            payload.max_shift_pct,
+            payload.target_roas,
+        )
+        result["response_curves"] = {}
+        result["data_window"] = {"start": None, "end": None, "days": 0}
+        result["budget_period"] = "daily"
+        return result
+    window_start = latest_fact_date - timedelta(days=29)
+    daily_rows = list(
+        (
+            await session.execute(
+                select(
+                    UnifiedFact.campaign_id,
+                    UnifiedFact.fact_date,
+                    func.sum(UnifiedFact.spend),
+                    func.sum(UnifiedFact.reconciled_revenue),
+                    func.sum(UnifiedFact.cogs),
+                    func.sum(UnifiedFact.contribution_profit),
+                )
+                .where(
+                    UnifiedFact.brand_id == brand.id,
+                    UnifiedFact.campaign_id.is_not(None),
+                    UnifiedFact.source != "simulator_clock",
+                    UnifiedFact.fact_date >= window_start,
+                    UnifiedFact.fact_date <= latest_fact_date,
+                )
+                .group_by(UnifiedFact.campaign_id, UnifiedFact.fact_date)
+                .order_by(UnifiedFact.campaign_id, UnifiedFact.fact_date)
+            )
+        ).all()
+    )
+    facts_by_campaign: dict[str, list[dict[str, float]]] = {}
+    for campaign_id, _, spend, revenue, cogs, profit in daily_rows:
+        facts_by_campaign.setdefault(campaign_id, []).append({
+            "spend": float(spend or 0),
+            "revenue": float(revenue or 0),
+            "cogs": float(cogs or 0),
+            "profit": float(profit or 0),
+        })
+    campaign_by_id = {campaign.id: campaign for campaign in campaigns}
     product_map = {
         item.campaign_id: item.product_id
         for item in (
-            await session.scalars(select(CampaignSkuMap))
+            await session.scalars(
+                select(CampaignSkuMap).where(
+                    CampaignSkuMap.campaign_id.in_(campaign_by_id)
+                )
+            )
         ).all()
-    }
+    } if campaign_by_id else {}
     products = {
         row.id: row
         for row in (
@@ -843,38 +934,86 @@ async def budget_optimizer(
     inventory_by_product = {}
     for item in inventories:
         inventory_by_product.setdefault(item.product_id, item)
-    campaigns = []
+    optimizer_campaigns = []
     response_curves = {}
-    for campaign, spend, profit, revenue in rows:
+    observed_days = (latest_fact_date - window_start).days + 1
+    for campaign_id, observations in facts_by_campaign.items():
+        campaign = campaign_by_id.get(campaign_id)
+        if campaign is None:
+            continue
         product_id = product_map.get(campaign.id)
         product = products.get(product_id)
         snapshot = inventory_by_product.get(product_id)
         cover = snapshot.on_hand / snapshot.units_per_day if snapshot and snapshot.units_per_day else 999
         points = [
-            {"spend": max(campaign.daily_budget * factor, 1), "incremental_profit": float(profit or 0) * factor**0.65}
-            for factor in (0.25, 0.5, 0.75, 1.0, 1.25)
+            {"spend": observation["spend"], "value": observation["revenue"]}
+            for observation in observations
+            if observation["spend"] > 0 and observation["revenue"] >= 0
         ]
-        response_curves[campaign.id] = fit_response_curve(points)
-        campaigns.append({
+        if len(points) >= 3:
+            revenue_curve = fit_response_curve(points)
+            fit_method = "fitted_to_daily_revenue"
+        else:
+            average_spend = sum(item["spend"] for item in observations) / observed_days
+            average_revenue = sum(item["revenue"] for item in observations) / observed_days
+            revenue_curve = {
+                "scale": round(2 * average_revenue, 4),
+                "half_saturation": round(max(average_spend, 0.01), 4),
+                "r_squared": 0.0,
+            }
+            fit_method = "recent_average_fallback"
+        response_curves[campaign.id] = {**revenue_curve, "fit_method": fit_method}
+        optimizer_campaigns.append({
             "campaign_id": campaign.id,
             "name": campaign.name,
-            "spend": float(spend or 0),
-            "profit": float(profit or 0),
-            "roas": float(revenue or 0) / float(spend or 1),
-            "inventory_cover_days": cover,
-            "product_margin": (
-                (product.price - product.unit_cost) / product.price
-                if product and product.price else 0
+            "daily_budget": float(campaign.daily_budget),
+            "roas": (
+                sum(item["revenue"] for item in observations)
+                / max(sum(item["spend"] for item in observations), 0.01)
             ),
+            "revenue_curve": revenue_curve,
+            "cogs_rate": (
+                sum(item["cogs"] for item in observations)
+                / max(sum(item["revenue"] for item in observations), 0.01)
+            ),
+            "inventory_cover_days": cover,
         })
     result = optimize_budget(
-        campaigns,
+        optimizer_campaigns,
         payload.total_budget,
         payload.max_shift_pct,
         payload.target_roas,
     )
     result["response_curves"] = response_curves
+    result["data_window"] = {
+        "start": window_start.isoformat(),
+        "end": latest_fact_date.isoformat(),
+        "days": observed_days,
+    }
+    result["budget_period"] = "daily"
     return result
+
+
+def _project_campaign_day(
+    metric: AdMetricDaily,
+    daily_budget: float,
+    unit_cost: float,
+) -> dict[str, float]:
+    utilization = min(1.0, max(0.1, metric.spend / max(daily_budget, 1)))
+    spend = daily_budget * utilization
+    baseline_roas = metric.attributed_revenue / metric.spend if metric.spend else 0
+    relative_scale = spend / metric.spend if metric.spend else 1
+    marginal_dampener = 1 / (1 + max(0, relative_scale - 1) * 0.18)
+    revenue = spend * baseline_roas * marginal_dampener
+    conversions = metric.conversions * relative_scale * marginal_dampener
+    cogs = conversions * unit_cost
+    return {
+        "spend": spend,
+        "revenue": revenue,
+        "conversions": conversions,
+        "cogs": cogs,
+        "profit": revenue - cogs - spend,
+    }
 
 
 @router.post("/simulation/clock/advance")
@@ -896,6 +1035,21 @@ async def advance_simulation_clock(
         ).all()
     )
     campaign_ids = [campaign.id for campaign in campaigns]
+    occupied_metric_dates = set()
+    if campaign_ids:
+        occupied_metric_dates = {
+            (campaign_id, metric_date)
+            for campaign_id, metric_date in (
+                await session.execute(
+                    select(AdMetricDaily.campaign_id, AdMetricDaily.metric_date).where(
+                        AdMetricDaily.campaign_id.in_(campaign_ids),
+                        AdMetricDaily.metric_date > state.simulated_date,
+                        AdMetricDaily.metric_date
+                        <= state.simulated_date + timedelta(days=payload.days),
+                    )
+                )
+            ).all()
+        }
     mappings = {
         item.campaign_id: item.product_id
         for item in (
@@ -910,57 +1064,116 @@ async def advance_simulation_clock(
             await session.scalars(select(Product).where(Product.brand_id == brand.id))
         ).all()
     }
-    last_metrics = {}
-    for campaign in campaigns:
-        metric = await session.scalar(
-            select(AdMetricDaily)
-            .where(AdMetricDaily.campaign_id == campaign.id)
-            .order_by(AdMetricDaily.metric_date.desc())
-            .limit(1)
+    recent_metric_ranks = (
+        select(
+            AdMetricDaily.campaign_id,
+            AdMetricDaily.id.label("metric_id"),
+            func.row_number().over(
+                partition_by=AdMetricDaily.campaign_id,
+                order_by=AdMetricDaily.metric_date.desc(),
+            ).label("metric_rank"),
         )
-        if metric:
-            last_metrics[campaign.id] = metric
+        .where(
+            AdMetricDaily.campaign_id.in_(campaign_ids),
+            AdMetricDaily.metric_date <= state.simulated_date,
+            AdMetricDaily.source_payload["clock_day"].as_string().is_(None),
+        )
+        .subquery()
+    ) if campaign_ids else None
+    recent_metrics = list(
+        (
+            await session.scalars(
+                select(AdMetricDaily)
+                .join(
+                    recent_metric_ranks,
+                    AdMetricDaily.id == recent_metric_ranks.c.metric_id,
+                )
+                .where(recent_metric_ranks.c.metric_rank <= 30)
+                .order_by(
+                    AdMetricDaily.campaign_id,
+                    AdMetricDaily.metric_date.desc(),
+                )
+            )
+        ).all()
+    ) if recent_metric_ranks is not None else []
+    metrics_by_campaign: dict[str, list[AdMetricDaily]] = {}
+    for metric in recent_metrics:
+        metrics_by_campaign.setdefault(metric.campaign_id, []).append(metric)
+    last_metrics = {
+        campaign_id: metrics[0]
+        for campaign_id, metrics in metrics_by_campaign.items()
+    }
+    platform_ids = {campaign.platform_id for campaign in campaigns}
+    platforms = list(
+        (
+            await session.scalars(
+                select(Platform).where(Platform.id.in_(platform_ids))
+            )
+        ).all()
+    ) if platform_ids else []
+    platform_names = {platform.id: platform.name for platform in platforms}
     generated_profit = 0.0
     counterfactual_profit = 0.0
-    for offset in range(1, payload.days + 1):
+    for _ in range(payload.days):
         sim_date = state.simulated_date + timedelta(days=1)
         state.simulated_date = sim_date
         for campaign in campaigns:
-            metric = last_metrics.get(campaign.id)
+            campaign_metrics = metrics_by_campaign.get(campaign.id, [])
+            metric = next(
+                (
+                    item
+                    for item in campaign_metrics
+                    if item.metric_date.weekday() == sim_date.weekday()
+                ),
+                campaign_metrics[0] if campaign_metrics else None,
+            )
             if metric is None:
                 continue
-            utilization = min(1.0, max(0.1, metric.spend / max(campaign.daily_budget, 1)))
-            daily_spend = campaign.daily_budget * utilization
-            baseline_roas = metric.attributed_revenue / metric.spend if metric.spend else 0
-            relative_scale = daily_spend / metric.spend if metric.spend else 1
-            marginal_dampener = 1 / (1 + max(0, relative_scale - 1) * 0.18)
-            revenue = daily_spend * baseline_roas * marginal_dampener
-            previous_profit = metric.attributed_revenue - metric.spend
-            counterfactual_profit += previous_profit
-            product = products.get(mappings.get(campaign.id, ""))
-            units = max(0, round(metric.conversions * relative_scale))
-            cogs = units * product.unit_cost if product else 0
-            profit = revenue - cogs - daily_spend
-            generated_profit += profit
-            session.add(
-                AdMetricDaily(
-                    campaign_id=campaign.id,
-                    metric_date=sim_date,
-                    spend=daily_spend,
-                    impressions=round(metric.impressions * relative_scale),
-                    clicks=round(metric.clicks * relative_scale),
-                    conversions=metric.conversions * relative_scale * marginal_dampener,
-                    attributed_revenue=revenue,
-                    source_payload={"simulated": True, "clock_day": sim_date.isoformat()},
+            platform_name = platform_names.get(campaign.platform_id)
+            if platform_name is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Campaign {campaign.id} has no registered platform.",
                 )
+            product = products.get(mappings.get(campaign.id, ""))
+            unit_cost = product.unit_cost if product else 0
+            simulated = _project_campaign_day(
+                metric,
+                float(campaign.daily_budget),
+                unit_cost,
             )
+            baseline = _project_campaign_day(
+                metric,
+                max(float(metric.spend), 1),
+                unit_cost,
+            )
+            daily_spend = simulated["spend"]
+            revenue = simulated["revenue"]
+            cogs = simulated["cogs"]
+            profit = simulated["profit"]
+            relative_scale = daily_spend / metric.spend if metric.spend else 1
+            generated_profit += profit
+            counterfactual_profit += baseline["profit"]
+            metric_key = (campaign.id, sim_date)
+            if metric_key not in occupied_metric_dates:
+                session.add(
+                    AdMetricDaily(
+                        campaign_id=campaign.id,
+                        metric_date=sim_date,
+                        spend=daily_spend,
+                        impressions=round(metric.impressions * relative_scale),
+                        clicks=round(metric.clicks * relative_scale),
+                        conversions=simulated["conversions"],
+                        attributed_revenue=revenue,
+                        source_payload={"simulated": True, "clock_day": sim_date.isoformat()},
+                    )
+                )
+                occupied_metric_dates.add(metric_key)
             session.add(
                 UnifiedFact(
                     brand_id=brand.id,
                     fact_date=sim_date,
-                    platform=(
-                        await session.get(Platform, campaign.platform_id)
-                    ).name,
+                    platform=platform_name,
                     campaign_id=campaign.id,
                     product_id=product.id if product else None,
                     spend=daily_spend,
@@ -970,29 +1183,26 @@ async def advance_simulation_clock(
                     contribution_profit=profit,
                     clicks=round(metric.clicks * relative_scale),
                     impressions=round(metric.impressions * relative_scale),
-                    conversions=metric.conversions * relative_scale * marginal_dampener,
+                    conversions=simulated["conversions"],
                     reconciliation_factor=1,
                     source="simulator_clock",
                 )
             )
         state.advanced_days += 1
 
-    absolute_error = abs(generated_profit - counterfactual_profit)
-    mape = absolute_error / max(abs(generated_profit), 1) * 100
     state.cumulative_profit_uplift += generated_profit - counterfactual_profit
     state.updated_at = datetime.now(timezone.utc)
     session.add(
         ModelRegistry(
-            name="adpilot_clock_calibration",
+            name="adpilot_clock_simulation_comparison",
             version=f"clock-{state.advanced_days}",
             metrics={
-                "mape_pct": round(mape, 3),
-                "actual_profit": round(generated_profit, 2),
-                "counterfactual_profit": round(counterfactual_profit, 2),
+                "simulated_profit": round(generated_profit, 2),
+                "baseline_profit": round(counterfactual_profit, 2),
             },
             parameters={
                 "days_advanced": payload.days,
-                "profit_adjustment_factor": round(
+                "simulated_to_baseline_profit_ratio": round(
                     generated_profit / counterfactual_profit,
                     5,
                 ) if abs(counterfactual_profit) > 1e-9 else 1,
@@ -1009,24 +1219,79 @@ async def advance_simulation_clock(
             )
         ).all()
     )
-    for recommendation in executed_recommendations:
-        execution = await session.scalar(
-            select(Execution)
-            .where(Execution.recommendation_id == recommendation.id, Execution.status == "executed")
-            .order_by(Execution.executed_at.desc())
-            .limit(1)
-        )
-        if execution:
-            session.add(
-                Outcome(
-                    recommendation_id=recommendation.id,
-                    execution_id=execution.id,
-                    actual_profit=generated_profit,
-                    counterfactual_profit=counterfactual_profit,
-                    mape=mape,
-                    payload={"simulated_days": payload.days, "simulated_date": state.simulated_date.isoformat()},
+    recommendation_by_id = {item.id: item for item in executed_recommendations}
+    executions = list(
+        (
+            await session.scalars(
+                select(Execution).where(
+                    Execution.recommendation_id.in_(recommendation_by_id),
+                    Execution.status == "executed",
                 )
             )
+        ).all()
+    ) if recommendation_by_id else []
+    existing_outcome_execution_ids = {
+        execution_id
+        for execution_id in (
+            await session.scalars(
+                select(Outcome.execution_id).where(
+                    Outcome.execution_id.in_([item.id for item in executions])
+                )
+            )
+        ).all()
+    } if executions else set()
+    measured_outcomes = []
+    campaign_by_id = {item.id: item for item in campaigns}
+    for execution in executions:
+        recommendation = recommendation_by_id[execution.recommendation_id]
+        if execution.id in existing_outcome_execution_ids:
+            continue
+        campaign_id = recommendation.campaign_id
+        metric = last_metrics.get(campaign_id or "")
+        before_budget = execution.before_state.get("daily_budget")
+        after_budget = execution.after_state.get("daily_budget")
+        campaign = campaign_by_id.get(campaign_id or "")
+        if (
+            metric is None
+            or campaign is None
+            or before_budget is None
+            or after_budget is None
+        ):
+            continue
+        product = products.get(mappings.get(campaign.id, ""))
+        unit_cost = product.unit_cost if product else 0
+        campaign_baseline_profit = (
+            _project_campaign_day(metric, float(before_budget), unit_cost)["profit"]
+            * payload.days
+        )
+        campaign_actual_profit = (
+            _project_campaign_day(metric, float(after_budget), unit_cost)["profit"]
+            * payload.days
+        )
+        uplift = campaign_actual_profit - campaign_baseline_profit
+        session.add(
+            Outcome(
+                recommendation_id=recommendation.id,
+                execution_id=execution.id,
+                actual_profit=campaign_actual_profit,
+                counterfactual_profit=campaign_baseline_profit,
+                mape=0,
+                payload={
+                    "simulated_days": payload.days,
+                    "simulated_date": state.simulated_date.isoformat(),
+                    "campaign_id": campaign.id,
+                    "scope": "executed_campaign",
+                    "forecast_error_available": False,
+                },
+            )
+        )
+        measured_outcomes.append({
+            "recommendation_id": recommendation.id,
+            "title": recommendation.title,
+            "actual_profit": round(campaign_actual_profit, 2),
+            "counterfactual_profit": round(campaign_baseline_profit, 2),
+            "profit_uplift": round(uplift, 2),
+        })
     await session.commit()
     return {
         "simulated_date": _iso(state.simulated_date),
@@ -1035,8 +1300,11 @@ async def advance_simulation_clock(
         "counterfactual_profit": round(counterfactual_profit, 2),
         "profit_uplift": round(generated_profit - counterfactual_profit, 2),
         "cumulative_profit_uplift": round(state.cumulative_profit_uplift, 2),
-        "mape_pct": round(mape, 3),
-        "model_recalibrated": True,
+        "mape_pct": None,
+        "forecast_error_available": False,
+        "comparison_recorded": True,
+        "model_recalibrated": False,
+        "measured_outcomes": measured_outcomes,
     }
 
 
@@ -1053,6 +1321,10 @@ async def learning(session: AsyncSession = Depends(get_session)):
             )
         ).all()
     )
+    outcomes = [
+        item for item in outcomes
+        if item.payload.get("scope") == "executed_campaign"
+    ]
     models = list(
         (
             await session.scalars(
@@ -1061,8 +1333,13 @@ async def learning(session: AsyncSession = Depends(get_session)):
         ).all()
     )
     wins = sum(item.actual_profit > item.counterfactual_profit for item in outcomes)
-    losses = len(outcomes) - wins
-    mape = [item.mape for item in outcomes]
+    losses = sum(item.actual_profit < item.counterfactual_profit for item in outcomes)
+    ties = len(outcomes) - wins - losses
+    forecast_errors = [
+        item.mape
+        for item in outcomes
+        if item.payload.get("forecast_error_available") is True
+    ]
     state = await session.scalar(
         select(SimulationState).where(SimulationState.brand_id == brand.id)
     )
@@ -1070,8 +1347,12 @@ async def learning(session: AsyncSession = Depends(get_session)):
         "outcome_count": len(outcomes),
         "wins": wins,
         "losses": losses,
+        "ties": ties,
         "win_rate": wins / len(outcomes) if outcomes else 0,
-        "mean_absolute_percentage_error": float(np.mean(mape)) if mape else 0,
+        "mean_absolute_percentage_error": (
+            float(np.mean(forecast_errors)) if forecast_errors else None
+        ),
+        "forecast_error_count": len(forecast_errors),
         "cumulative_profit_uplift": state.cumulative_profit_uplift if state else 0,
         "models": [
             {
@@ -1498,7 +1779,7 @@ async def optimization_curve(session: AsyncSession = Depends(get_session)):
                 [
                     {
                         "spend": max(1, campaign.daily_budget * factor),
-                        "incremental_profit": campaign.daily_budget * factor * (1 + factor) ** -0.7,
+                        "value": campaign.daily_budget * factor * (1 + factor) ** -0.7,
                     }
                     for factor in (0.25, 0.5, 0.75, 1, 1.25)
                 ]
